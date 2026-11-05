@@ -1,5 +1,5 @@
 {
-    "name": "spamast/laravel-sso-client",
+    "name": "jani/spamast-sso-client",
     "description": "SPAMAST SSO client for Laravel apps: sign in from the hub, pending accounts, and a hub API for the mobile app.",
     "type": "library",
     "license": "proprietary",
