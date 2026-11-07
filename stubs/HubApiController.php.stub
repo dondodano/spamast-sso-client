@@ -3,55 +3,67 @@
 namespace App\Http\Controllers\Sso;
 
 use App\Enums\OriginType;
-use App\Events\SendProcurementPlanNotificationEvent;
-use App\Events\SendProcurementRequestNotificationEvent;
 use App\Helpers\ProcurementPlanStatus;
 use App\Helpers\ProcurementRequestStatus;
 use App\Http\Controllers\Controller;
+use App\Http\Resources\Api\ProcurementPlanResource;
+use App\Http\Resources\Api\ProcurementRequestResource;
 use App\Models\ProcurementPlan;
 use App\Models\ProcurementRequest;
 use App\Models\User;
+use App\Services\DocumentActions;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Notifications\DatabaseNotification;
 use Illuminate\Support\Collection;
+use Illuminate\Validation\ValidationException;
 
 /**
  * PGSMS for the SPAMAST SSO mobile app, through the hub (/api/hub/*, see
  * AuthenticateHub): my PPMPs and PRs, the documents waiting at my role, their
- * details, the workflow step my role takes on them, and my notifications.
+ * details, the actions I can take on them, and my notifications.
  *
- * The steps — advance, review, certify, approve — do exactly what the panels'
- * table actions do (App\Tables\ProcurementPlansTable / ProcurementRequestsTable):
- * the same signatory columns, the user's uploaded signature, and the same
- * notification events, so emails, SMS and in-app notices go out as on the web.
- * They also keep the workflow's order: a step only once the one before it is done.
+ * Actions go through App\Services\DocumentActions, the same as the panels and
+ * the web API: the same permissions, signatures, remarks and notifications
+ * (database, email and broadcast). A document's details carry PGSMS's own API
+ * resource (`full`), so the app shows what the web shows. Who may see a
+ * document is the models' own visibleTo() scope.
  */
 class HubApiController extends Controller
 {
     /**
-     * Steps per document type, in order: [role, signatory column prefix, needs a signature, event action, done before].
+     * The step each role takes next, in order, for the "waiting for me" list:
+     * [role, signatory column prefix, the column done before].
      * PPMP: noted (unit head, on the web) → advanced → reviewed → approved.
      * PR:   prepared → advanced → reviewed → certified → approved.
      */
     private const STEPS = [
         'ppmp' => [
-            'advance' => ['role' => 'advancer', 'col' => 'advanced', 'sign' => false, 'event' => 'advanced', 'after' => 'noted'],
-            'review'  => ['role' => 'reviewer', 'col' => 'reviewed', 'sign' => true, 'event' => 'reviewed', 'after' => 'advanced'],
-            'approve' => ['role' => 'approver', 'col' => 'approved', 'sign' => true, 'event' => 'approved', 'after' => 'reviewed'],
+            'advance' => ['role' => 'advancer', 'col' => 'advanced', 'after' => 'noted'],
+            'review'  => ['role' => 'reviewer', 'col' => 'reviewed', 'after' => 'advanced'],
+            'approve' => ['role' => 'approver', 'col' => 'approved', 'after' => 'reviewed'],
         ],
         'pr' => [
-            'advance' => ['role' => 'advancer', 'col' => 'advanced', 'sign' => false, 'event' => 'advanced', 'after' => 'prepared'],
-            'review'  => ['role' => 'reviewer', 'col' => 'reviewed', 'sign' => true, 'event' => 'reviewed', 'after' => 'advanced'],
-            'certify' => ['role' => 'certifier', 'col' => 'certified', 'sign' => true, 'event' => 'certified', 'after' => 'reviewed'],
-            'approve' => ['role' => 'approver', 'col' => 'approved', 'sign' => true, 'event' => 'approved', 'after' => 'certified'],
+            'advance' => ['role' => 'advancer', 'col' => 'advanced', 'after' => 'prepared'],
+            'review'  => ['role' => 'reviewer', 'col' => 'reviewed', 'after' => 'advanced'],
+            'certify' => ['role' => 'certifier', 'col' => 'certified', 'after' => 'reviewed'],
+            'approve' => ['role' => 'approver', 'col' => 'approved', 'after' => 'certified'],
         ],
     ];
 
     private const LABELS = ['advance' => 'Advance', 'review' => 'Review', 'certify' => 'Certify', 'approve' => 'Approve'];
-    private const DONE = ['advance' => 'advanced', 'review' => 'reviewed', 'certify' => 'certified', 'approve' => 'approved'];
+
+    /** What a list needs loaded: the unit, the signatory row, who prepared it and its items (for the amount). */
+    private const LIST_WITH = [
+        'ppmp' => ['unit', 'signatory', 'preparedBy', 'groupItems'],
+        'pr'   => ['unit', 'signatory', 'preparedBy', 'items'],
+    ];
+
+    public function __construct(private DocumentActions $actions)
+    {
+    }
 
     /** Who I am in PGSMS, what I can do here, and my counts. */
     public function me(Request $request): JsonResponse
@@ -61,7 +73,7 @@ class HubApiController extends Controller
         return response()->json([
             'account' => [
                 'name'          => trim((string) $user->full_name_post_nominal) ?: $user->getFilamentName(),
-                'roles'         => array_values(array_map(fn ($slug) => ucfirst($slug), $user->getRoleSlugs())),
+                'roles'         => collect($user->getRoleSlugs())->map(fn ($slug) => ucfirst($slug))->values()->all(),
                 'unit'          => $user->currentUnit()?->description ?? $user->currentUnit()?->code,
                 'has_signature' => filled($user->signature?->path),
             ],
@@ -86,52 +98,46 @@ class HubApiController extends Controller
     public function show(Request $request, string $type, int $id): JsonResponse
     {
         $user = $request->user();
-        $doc = $this->load($type, $id);
+        $doc = $this->load($type, $id, $user);
 
-        if (! $doc || ! $user->can('view', $doc)) {
+        if (! $doc) {
             return response()->json(['error' => 'not_found', 'message' => 'That document was not found.'], 404);
         }
 
         return response()->json(['data' => $this->detail($type, $doc, $user)]);
     }
 
-    /** Takes my role's step on a document: advance, review, certify or approve. */
+    /**
+     * Takes an action on a document: any that DocumentActions offers me now (advance, review,
+     * certify, approve, remark, resolve, revert, cancel…), exactly as the web does. Actions that
+     * take text (a remark, a resolution, a reason) get it as `text`.
+     */
     public function act(Request $request, string $type, int $id, string $action): JsonResponse
     {
         $user = $request->user();
-        $step = self::STEPS[$type][$action] ?? null;
-        $doc = $this->load($type, $id);
+        $doc = preg_match('/^[a-z_]{2,40}$/', $action) ? $this->load($type, $id, $user) : null;
 
-        if (! $step || ! $doc || ! $user->can('view', $doc)) {
+        if (! $doc) {
             return response()->json(['error' => 'not_found', 'message' => 'That document was not found.'], 404);
         }
-        if (! $user->hasRole($step['role'])) {
-            return response()->json(['error' => 'not_allowed', 'message' => 'Your PGSMS role cannot ' . strtolower(self::LABELS[$action]) . ' this document.'], 403);
-        }
-        if (! $this->isReadyFor($type, $doc, $step)) {
-            return response()->json(['error' => 'not_ready', 'message' => $this->reference($type, $doc) . ' is not waiting for this step anymore.'], 409);
-        }
-        if ($step['sign'] && blank($user->signature?->path)) {
-            return response()->json(['error' => 'signature_required', 'message' => 'Upload your signature in PGSMS first (Profile → Signature).'], 403);
+
+        $label = $this->actions->definitions($doc, $user)[$action]['label'] ?? ucfirst(str_replace('_', ' ', $action));
+        $text = trim((string) $request->input('text', $request->input('remarks', '')));
+
+        try {
+            $this->actions->perform($doc, $user, $action, $text !== '' ? mb_substr($text, 0, 2000) : null);
+        } catch (ValidationException $e) {
+            $message = collect($e->errors())->flatten()->first() ?: $e->getMessage();
+            $code = str_contains(strtolower($message), 'signature') ? 'signature_required'
+                : (str_contains($message, 'field is required') ? 'text_required' : 'not_allowed');
+
+            return response()->json(['error' => $code, 'message' => $message], $code === 'text_required' ? 422 : 403);
         }
 
-        $signatory = $doc->signatory ?? $doc->signatory()->make();
-        $signatory->fill(array_filter([
-            $step['col'] . '_by'        => $user->id,
-            $step['col'] . '_signature' => $step['sign'] ? $user->signature?->path : null,
-            $step['col'] . '_at'        => now(),
-        ], fn ($v) => $v !== null))->save();
-
-        $event = $type === 'ppmp' ? SendProcurementPlanNotificationEvent::class : SendProcurementRequestNotificationEvent::class;
-        $event::dispatch($doc, [
-            'from'   => $user->only(['id', 'full_name_post_nominal', 'roles']),
-            'action' => $step['event'],
-        ]);
-
-        $doc = $this->load($type, $id);
+        $doc = $this->load($type, $id, $user);
 
         return response()->json([
-            'message' => $this->reference($type, $doc) . ' — ' . self::DONE[$action] . '.',
+            'message' => $this->reference($type, $doc) . ': ' . $label . ' done.',
             'data'    => $this->detail($type, $doc, $user),
         ]);
     }
@@ -167,8 +173,8 @@ class HubApiController extends Controller
 
     private function mine(User $user): Collection
     {
-        $plans = ProcurementPlan::with(['unit', 'signatory', 'clusters'])->where('prepared_by', $user->id)->latest()->limit(30)->get();
-        $requests = ProcurementRequest::with(['unit', 'signatory', 'clusters'])->where('prepared_by', $user->id)->latest()->limit(30)->get();
+        $plans = ProcurementPlan::with(self::LIST_WITH['ppmp'])->where('prepared_by', $user->id)->latest()->limit(30)->get();
+        $requests = ProcurementRequest::with(self::LIST_WITH['pr'])->where('prepared_by', $user->id)->latest()->limit(30)->get();
 
         return $plans->map(fn ($d) => $this->summary('ppmp', $d))
             ->concat($requests->map(fn ($d) => $this->summary('pr', $d)))
@@ -187,12 +193,12 @@ class HubApiController extends Controller
                 }
 
                 $query = ($type === 'ppmp' ? ProcurementPlan::query() : ProcurementRequest::query())
-                    ->with(['unit', 'signatory', 'clusters', 'preparedBy'])
+                    ->with(self::LIST_WITH[$type])
                     ->where('is_published', true)
                     ->whereNull('cancelled_at')
                     ->where(fn (Builder $q) => $q->whereNull('origin')->orWhere('origin', '!=', OriginType::Paper));
 
-                $this->whereReadyFor($type, $query, $step);
+                $this->whereReadyFor($query, $step);
 
                 foreach ($query->oldest('updated_at')->limit(50)->get() as $doc) {
                     $out->push($this->summary($type, $doc) + ['next' => ['action' => $action, 'label' => self::LABELS[$action]]]);
@@ -204,7 +210,7 @@ class HubApiController extends Controller
     }
 
     /** Previous step done, this one not — in SQL. */
-    private function whereReadyFor(string $type, Builder $query, array $step): void
+    private function whereReadyFor(Builder $query, array $step): void
     {
         if ($step['after'] === 'prepared') {
             $query->whereNotNull('prepared_at')->where(fn (Builder $q) => $q->doesntHave('signatory')
@@ -213,20 +219,14 @@ class HubApiController extends Controller
             return;
         }
 
-        $query->whereHas('signatory', fn (Builder $s) => $s->whereNotNull($step['after'] . '_at')->whereNull($step['col'] . '_at'));
-    }
+        if ($step['after'] === 'noted') {
+            $query->whereNotNull('noted_at')->where(fn (Builder $q) => $q->doesntHave('signatory')
+                ->orWhereHas('signatory', fn (Builder $s) => $s->whereNull($step['col'] . '_at')));
 
-    /** Previous step done, this one not — for one loaded document. */
-    private function isReadyFor(string $type, Model $doc, array $step): bool
-    {
-        if ($doc->cancelled_at || ! $doc->is_published || $doc->isPaperBased()) {
-            return false;
+            return;
         }
 
-        $sig = $doc->signatory;
-        $before = $step['after'] === 'prepared' ? $doc->prepared_at : $sig?->{$step['after'] . '_at'};
-
-        return $before !== null && ($sig?->{$step['col'] . '_at'} === null);
+        $query->whereHas('signatory', fn (Builder $s) => $s->whereNotNull($step['after'] . '_at')->whereNull($step['col'] . '_at'));
     }
 
     // ── Shapes ──────────────────────────────────────────────────────────────
@@ -243,49 +243,94 @@ class HubApiController extends Controller
                 : ((string) $doc->purpose ?: 'Purchase request'),
             'status'      => $type === 'ppmp' ? ProcurementPlanStatus::getStatus($doc) : ProcurementRequestStatus::getStatus($doc),
             'unit'        => $doc->unit?->description ?? $doc->unit?->code,
-            'amount'      => $doc->isPaperBased() && $doc->paper_amount ? (float) $doc->paper_amount : (float) $doc->clusters->sum('amount'),
-            'prepared_by' => $doc->preparedBy?->full_name_post_nominal,
+            'amount'      => $this->amount($type, $doc),
+            'prepared_by' => $doc->preparedBy?->full_name_post_nominal ?? $doc->preparedBy?->getFilamentName(),
             'is_draft'    => ! $doc->is_published,
             'updated_at'  => $doc->updated_at?->toIso8601String(),
         ];
     }
 
-    private function detail(string $type, Model $doc, User $user): array
+    /** A paper document's recorded amount, else the sum of its items (PPMP budgets, PR quantity × unit cost). */
+    private function amount(string $type, Model $doc): float
     {
-        $doc->loadMissing(['clusters.items', 'preparedBy']);
-        $breakdown = $type === 'ppmp' ? ProcurementPlanStatus::getBreakdown($doc) : ProcurementRequestStatus::getBreakdown($doc);
-
-        $actions = [];
-        foreach (self::STEPS[$type] as $action => $step) {
-            if ($user->hasRole($step['role']) && $this->isReadyFor($type, $doc, $step)) {
-                $actions[] = ['action' => $action, 'label' => self::LABELS[$action], 'needs_signature' => $step['sign']];
-            }
+        if ($doc->paperBased() && $doc->paper_amount) {
+            return (float) $doc->paper_amount;
         }
 
+        return $type === 'ppmp'
+            ? (float) $doc->groupItems->sum('budget')
+            : round((float) $doc->items->sum(fn ($i) => (float) $i->quantity * (float) $i->unit_cost), 2);
+    }
+
+    private function detail(string $type, Model $doc, User $user): array
+    {
+        $doc->loadMissing($type === 'ppmp' ? ['groups.items', 'groupItems', 'remarks'] : ['items', 'pos', 'remarks']);
+
+        $available = $this->actions->available($doc, $user);
+
         return $this->summary($type, $doc) + [
-            'mine'     => $doc->prepared_by === $user->id,
-            'clusters' => $doc->clusters->map(fn ($c) => [
-                'name'   => $c->name,
-                'amount' => (float) $c->amount,
-                'items'  => $c->items->map(fn ($i) => [
-                    'description' => $i->description,
-                    'quantity'    => $i->quantity,
-                    'unit'        => $i->unit,
-                    'amount'      => $type === 'pr'
-                        ? round((float) $i->quantity * (float) $i->unit_cost, 2)
-                        : (isset($i->budget) ? (float) $i->budget : null),
-                ])->values(),
-            ])->values(),
-            'timeline' => collect($breakdown)->map(fn ($s) => [
-                'step' => $s['label'],
-                'done' => (bool) $s['signed'],
-                'at'   => $s['signed_at']?->toIso8601String(),
-            ])->values(),
-            'actions'  => $actions,
+            'mine'     => (int) $doc->prepared_by === (int) $user->id,
+            // Kept for app versions before the full document screen: items by group, the stages, the main steps.
+            'clusters' => $this->clusters($type, $doc),
+            'timeline' => $this->timeline($type, $doc),
+            'actions'  => collect($available)
+                ->filter(fn ($a) => isset(self::LABELS[$a['key']]))
+                ->map(fn ($a) => ['action' => $a['key'], 'label' => $a['label'], 'needs_signature' => $a['key'] !== 'advance'])
+                ->values()->all(),
+            'full'     => $this->full($type, $doc),
         ];
     }
 
-    private function load(string $type, int $id): ?Model
+    /** Items by group: a PPMP's groups, or a PR's items grouped by their item group. */
+    private function clusters(string $type, Model $doc): array
+    {
+        $item = fn ($i, ?float $amount) => [
+            'description' => $i->description,
+            'quantity'    => $i->quantity,
+            'unit'        => is_object($i->unit) ? ($i->unit->label ?? null) : $i->unit,
+            'amount'      => $amount,
+        ];
+
+        if ($type === 'ppmp') {
+            return $doc->groups->sortBy('sort')->values()->map(fn ($g) => [
+                'name'   => (string) $g->description,
+                'amount' => (float) $g->items->sum('budget'),
+                'items'  => $g->items->sortBy('sort')->values()->map(fn ($i) => $item($i, isset($i->budget) ? (float) $i->budget : null))->all(),
+            ])->all();
+        }
+
+        return $doc->items->groupBy(fn ($i) => (string) ($i->item_group ?: 'Items'))->map(fn ($items, $group) => [
+            'name'   => (string) $group,
+            'amount' => round((float) $items->sum(fn ($i) => (float) $i->quantity * (float) $i->unit_cost), 2),
+            'items'  => $items->values()->map(fn ($i) => $item($i, round((float) $i->quantity * (float) $i->unit_cost, 2)))->all(),
+        ])->values()->all();
+    }
+
+    /** The signing stages, done or not, with their dates. */
+    private function timeline(string $type, Model $doc): array
+    {
+        $sig = $doc->signatory;
+        $stages = $type === 'ppmp'
+            ? ['Prepared' => $doc->prepared_at, 'Noted' => $doc->noted_at, 'Advanced' => $sig?->advanced_at, 'Reviewed' => $sig?->reviewed_at, 'Approved' => $sig?->approved_at]
+            : ['Prepared' => $doc->prepared_at, 'Advanced' => $sig?->advanced_at, 'Reviewed' => $sig?->reviewed_at, 'Certified' => $sig?->certified_at, 'Approved' => $sig?->approved_at];
+
+        return collect($stages)->map(fn ($at, $step) => [
+            'step' => $step,
+            'done' => $at !== null,
+            'at'   => $at ? \Illuminate\Support\Carbon::parse($at)->toIso8601String() : null,
+        ])->values()->all();
+    }
+
+    /** PGSMS's own API resource for the document: what its web API returns, for the app's document screen. */
+    private function full(string $type, Model $doc): array
+    {
+        $resource = $type === 'ppmp' ? new ProcurementPlanResource($doc) : new ProcurementRequestResource($doc);
+
+        return json_decode(json_encode($resource->resolve(request())), true) ?? [];
+    }
+
+    /** The document, if I may see it (the models' own visibleTo scope, as the panels and the web API). */
+    private function load(string $type, int $id, User $user): ?Model
     {
         $model = match ($type) {
             'ppmp'  => ProcurementPlan::class,
@@ -293,7 +338,7 @@ class HubApiController extends Controller
             default => null,
         };
 
-        return $model ? $model::with(['unit', 'signatory', 'clusters'])->find($id) : null;
+        return $model ? $model::visibleTo($user)->with(['unit', 'signatory', 'preparedBy'])->find($id) : null;
     }
 
     private function reference(string $type, Model $doc): string
@@ -301,4 +346,3 @@ class HubApiController extends Controller
         return $doc->series_number ?: (($type === 'ppmp' ? 'PPMP #' : 'PR #') . $doc->id);
     }
 }
-

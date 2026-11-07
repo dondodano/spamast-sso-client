@@ -62,7 +62,9 @@ return [
             'middleware' => ['api', 'throttle:120,1'],
             'controller' => 'App\\Http\\Controllers\\Sso\\HubApiController',
             'types'      => ['ppmp', 'pr'],
-            'actions'    => ['advance', 'review', 'certify', 'approve'],
+            'actions'    => ['publish', 'unpublish', 'sign', 'unsign', 'sign_as_preparer', 'unsign_as_preparer', 'sign_as_head', 'unsign_as_head',
+                'advance', 'revert_advance', 'review', 'unreview', 'certify', 'uncertify', 'approve', 'disapprove',
+                'remark', 'resolve', 'cancel', 'restore'],
         ],
     ],
 ];
