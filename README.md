@@ -54,3 +54,13 @@ php artisan vendor:publish --tag=sso-stubs   # -> app/Http/Controllers/Sso/HubAp
 
 Point `sso.routes.hub_api.controller` at your own class instead if you prefer. Routes are registered only when
 that class exists. Adjust `types` and `actions` in the config to match.
+
+The stub performs actions through the host app's `App\Services\DocumentActions`, so the same permissions,
+signatures, remarks and notifications apply as on the web. It also returns the app's own API resources
+(`App\Http\Resources\Api\ProcurementPlanResource` and `ProcurementRequestResource`) as `full` in a document's
+details, and limits who can see a document with the models' `visibleTo()` scope. These classes must exist in the app.
+
+`POST /api/hub/documents/{type}/{id}/{action}` accepts any action in `sso.routes.hub_api.actions`
+(by default: publish, unpublish, sign, unsign, sign_as_preparer, unsign_as_preparer, sign_as_head,
+unsign_as_head, advance, revert_advance, review, unreview, certify, uncertify, approve, disapprove, remark,
+resolve, cancel, restore). Actions that take text (a remark, a resolution, a reason) read it from `text`.
