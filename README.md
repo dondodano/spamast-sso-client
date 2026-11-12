@@ -64,3 +64,10 @@ details, and limits who can see a document with the models' `visibleTo()` scope.
 (by default: publish, unpublish, sign, unsign, sign_as_preparer, unsign_as_preparer, sign_as_head,
 unsign_as_head, advance, revert_advance, review, unreview, certify, uncertify, approve, disapprove, remark,
 resolve, cancel, restore). Actions that take text (a remark, a resolution, a reason) read it from `text`.
+
+### Executive summary
+
+`GET /api/hub/summary?days=30|90|365` serves school-wide procurement figures (counts and amounts, never names)
+for the SSO executive dashboard. Only the hub token is checked; no PGSMS account is needed. The same
+`sso-stubs` publish adds `app/Http/Controllers/Sso/HubSummaryController.php` and `tests/Feature/HubSummaryTest.php`.
+The route is registered when `sso.routes.hub_api.summary_controller` exists. Results are cached for ten minutes.

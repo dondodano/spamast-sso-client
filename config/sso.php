@@ -61,6 +61,9 @@ return [
             'prefix'     => 'api/hub',
             'middleware' => ['api', 'throttle:120,1'],
             'controller' => 'App\\Http\\Controllers\\Sso\\HubApiController',
+            // GET {prefix}/summary: school-wide figures for the SSO executive dashboard. Guarded by
+            // the hub token alone (no person needed). Skipped while the class does not exist.
+            'summary_controller' => 'App\\Http\\Controllers\\Sso\\HubSummaryController',
             'types'      => ['ppmp', 'pr'],
             'actions'    => ['publish', 'unpublish', 'sign', 'unsign', 'sign_as_preparer', 'unsign_as_preparer', 'sign_as_head', 'unsign_as_head',
                 'advance', 'revert_advance', 'review', 'unreview', 'certify', 'uncertify', 'approve', 'disapprove',

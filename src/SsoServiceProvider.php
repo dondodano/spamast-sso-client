@@ -21,7 +21,7 @@ class SsoServiceProvider extends ServiceProvider
         }
 
         $api = config('sso.routes.hub_api');
-        if (($api['enabled'] ?? false) && class_exists($api['controller'] ?? '')) {
+        if (($api['enabled'] ?? false) && (class_exists($api['controller'] ?? '') || class_exists($api['summary_controller'] ?? ''))) {
             $this->loadRoutesFrom(__DIR__ . '/../routes/api.php');
         }
 
@@ -31,6 +31,8 @@ class SsoServiceProvider extends ServiceProvider
             $this->publishes([__DIR__ . '/../database/migrations' => database_path('migrations')], 'sso-migrations');
             $this->publishes([
                 __DIR__ . '/../stubs/HubApiController.php.stub' => app_path('Http/Controllers/Sso/HubApiController.php'),
+                __DIR__ . '/../stubs/HubSummaryController.php.stub' => app_path('Http/Controllers/Sso/HubSummaryController.php'),
+                __DIR__ . '/../stubs/HubSummaryTest.php.stub' => base_path('tests/Feature/HubSummaryTest.php'),
             ], 'sso-stubs');
         }
     }

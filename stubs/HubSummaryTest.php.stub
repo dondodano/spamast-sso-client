@@ -1,0 +1,119 @@
+<?php
+
+namespace Tests\Feature;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Tests\TestCase;
+
+/** GET /api/hub/summary: school-wide procurement figures for the SPAMAST SSO executive dashboard. */
+class HubSummaryTest extends TestCase
+{
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        config([
+            'database.default' => 'sqlite',
+            'database.connections.sqlite' => ['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '', 'foreign_key_constraints' => true],
+            'cache.default' => 'array',
+            'activitylog.enabled' => false,
+            'sso.hub_token' => 'hub-secret',
+        ]);
+        DB::purge('sqlite');
+        DB::setDefaultConnection('sqlite');
+        if (DB::connection()->getDatabaseName() !== ':memory:') {
+            $this->fail('These tests must run on sqlite :memory: and must not touch the application database.');
+        }
+
+        // The real migrations use MySQL-only columns, so build the tables this endpoint reads (as MobileApiTest does).
+        Schema::create('units', function ($t): void {
+            $t->id(); $t->string('code'); $t->string('description')->nullable(); $t->boolean('is_active')->default(true); $t->timestamps(); $t->softDeletes();
+        });
+        Schema::create('procurement_requests', function ($t): void {
+            $t->id(); $t->string('series_number')->nullable(); $t->integer('procurement_plan_id')->nullable(); $t->integer('unit_id')->nullable();
+            $t->timestamp('prepared_at')->nullable(); $t->integer('prepared_by')->nullable(); $t->boolean('is_published')->default(true);
+            $t->string('origin')->default('digital'); $t->decimal('paper_amount', 14, 2)->nullable(); $t->timestamp('paper_approved_at')->nullable();
+            $t->boolean('is_seeded')->default(false); $t->timestamp('cancelled_at')->nullable(); $t->timestamps(); $t->softDeletes();
+        });
+        Schema::create('procurement_request_signatories', function ($t): void {
+            $t->id(); $t->integer('procurement_request_id');
+            foreach (['advanced', 'reviewed', 'certified', 'approved'] as $step) {
+                $t->integer("{$step}_by")->nullable(); $t->timestamp("{$step}_at")->nullable(); $t->string("{$step}_signature")->nullable();
+            }
+        });
+        Schema::create('procurement_request_remarks', function ($t): void {
+            $t->id(); $t->integer('procurement_request_id'); $t->integer('remarked_by')->nullable(); $t->text('remark')->nullable();
+            $t->integer('resolved_by')->nullable(); $t->text('resolution')->nullable(); $t->timestamp('resolved_at')->nullable(); $t->timestamps();
+        });
+        Schema::create('procurement_request_items', function ($t): void {
+            $t->id(); $t->integer('procurement_request_id'); $t->decimal('quantity', 12, 2)->default(0); $t->decimal('unit_cost', 14, 2)->default(0); $t->timestamps(); $t->softDeletes();
+        });
+        Schema::create('purchase_orders', function ($t): void {
+            $t->id(); $t->integer('procurement_request_id')->nullable(); $t->string('series_number')->nullable(); $t->decimal('total_amount', 14, 2)->default(0);
+            $t->boolean('is_published')->default(true); $t->timestamp('cancelled_at')->nullable(); $t->timestamps(); $t->softDeletes();
+        });
+    }
+
+    /** A PR inserted directly (no model events), with optional items, signatures and remark. */
+    private function pr(array $attrs = [], array $signed = [], array $items = [], bool $openRemark = false): int
+    {
+        $id = DB::table('procurement_requests')->insertGetId($attrs + ['created_at' => now()->subDays(3), 'updated_at' => now()->subDay(), 'prepared_at' => now()->subDays(3)]);
+        DB::table('procurement_request_signatories')->insert(['procurement_request_id' => $id] + $signed);
+        foreach ($items as [$qty, $cost]) {
+            DB::table('procurement_request_items')->insert(['procurement_request_id' => $id, 'quantity' => $qty, 'unit_cost' => $cost]);
+        }
+        if ($openRemark) {
+            DB::table('procurement_request_remarks')->insert(['procurement_request_id' => $id, 'remark' => 'Fix the specs', 'created_at' => now()]);
+        }
+
+        return $id;
+    }
+
+    public function test_only_the_hub_token_opens_it(): void
+    {
+        $this->getJson('/api/hub/summary')->assertUnauthorized();
+        $this->withToken('wrong')->getJson('/api/hub/summary')->assertUnauthorized();
+        // No PGSMS account is needed for the person looking.
+        $this->withToken('hub-secret')->getJson('/api/hub/summary?email=president@spamast.edu.ph')->assertOk()
+            ->assertJsonStructure(['as_of', 'metrics', 'trend', 'breakdown', 'alerts']);
+    }
+
+    public function test_it_sums_up_requests_approvals_and_orders(): void
+    {
+        $ict = DB::table('units')->insertGetId(['code' => 'ICT']);
+
+        // Approved this week: 2 × 1,500 + 1 × 2,000 = 5,000.
+        $this->pr(['unit_id' => $ict], ['advanced_at' => now()->subDays(2), 'reviewed_at' => now()->subDays(2), 'certified_at' => now()->subDay(), 'approved_at' => now()->subDay(), 'approved_by' => 1, 'approved_signature' => 'sig.png'], [[2, 1500], [1, 2000]]);
+        // A paper PR approved this week, with its recorded amount.
+        $this->pr(['unit_id' => $ict, 'origin' => 'paper', 'paper_amount' => 7000, 'paper_approved_at' => now()->subDays(2)]);
+        // In process: one moving, one stuck for 10 days, one with an open remark.
+        $this->pr(['unit_id' => $ict], ['advanced_at' => now()->subDay()]);
+        $this->pr(['updated_at' => now()->subDays(10)], ['advanced_at' => now()->subDays(12)]);
+        $this->pr([], [], [], openRemark: true);
+        // Not counted: cancelled, unpublished, an imported paper record filed now.
+        $this->pr(['cancelled_at' => now()]);
+        $this->pr(['is_published' => false]);
+        $this->pr(['is_seeded' => true, 'origin' => 'paper']);
+
+        DB::table('purchase_orders')->insert([
+            ['total_amount' => 120000, 'is_published' => true, 'cancelled_at' => null, 'created_at' => now()->subDays(5), 'updated_at' => now()],
+            ['total_amount' => 999999, 'is_published' => true, 'cancelled_at' => now(), 'created_at' => now()->subDays(5), 'updated_at' => now()],
+        ]);
+
+        $json = $this->withToken('hub-secret')->getJson('/api/hub/summary?days=30')->assertOk()->json();
+
+        $this->assertSame(5, $json['metrics'][0]['value']);                       // filed: 5 real, published, not cancelled
+        $this->assertSame('2 approved in this period', $json['metrics'][0]['hint']);
+        $this->assertEqualsWithDelta(12000.0, $json['metrics'][1]['value'], 0.01);  // 5,000 + 7,000
+        $this->assertEqualsWithDelta(120000.0, $json['metrics'][2]['value'], 0.01);
+        $this->assertSame('1 order issued', $json['metrics'][2]['hint']);
+        $this->assertSame(3, $json['metrics'][3]['value']);                       // in process
+        $this->assertSame('1 waiting over 7 days', $json['metrics'][3]['hint']);
+        $this->assertSame(['label' => 'ICT', 'value' => 3], $json['breakdown']['items'][0]);
+        $this->assertStringContainsString('waited more than 7 days', $json['alerts'][0]['text']);
+        $this->assertStringContainsString('remark', $json['alerts'][1]['text']);
+        $this->assertCount(5, $json['trend']['points']);
+        $this->assertCount(12, $this->withToken('hub-secret')->getJson('/api/hub/summary?days=365')->json('trend.points'));
+    }
+}

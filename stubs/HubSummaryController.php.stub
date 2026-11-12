@@ -1,0 +1,147 @@
+<?php
+
+namespace App\Http\Controllers\Sso;
+
+use App\Enums\OriginType;
+use App\Helpers\ProcurementRequestStatus;
+use App\Http\Controllers\Controller;
+use App\Models\ProcurementRequest;
+use App\Models\PurchaseOrder;
+use Carbon\CarbonImmutable;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+
+/**
+ * GET /api/hub/summary?days=30|90|365: PGSMS's school-wide procurement figures for the
+ * SPAMAST SSO executive dashboard (the President and Vice Presidents). Counts and amounts
+ * only, never names. Statuses come from ProcurementRequestStatus, as on the web.
+ *
+ * Only the hub calls it, with SSO_HUB_TOKEN. Unlike the rest of the hub API, the viewer
+ * does not need a PGSMS account: the answer is the same for every executive. Kept for ten
+ * minutes, as the hub also does.
+ */
+class HubSummaryController extends Controller
+{
+    /** Statuses of a PR that someone still has to act on. */
+    private const IN_PROCESS = ['Pending', 'Prepared', 'Advanced', 'Reviewed', 'Certified', 'Remarked', 'Resolved'];
+
+    public function __invoke(Request $request): JsonResponse
+    {
+        $secret = config('sso.hub_token');
+        if (! $secret) {
+            return response()->json(['error' => 'not_configured'], 503);
+        }
+        $presented = $request->bearerToken();
+        if (! is_string($presented) || ! hash_equals($secret, $presented)) {
+            return response()->json(['error' => 'unauthorized'], 401);
+        }
+
+        $days = in_array((int) $request->query('days'), [30, 90, 365], true) ? (int) $request->query('days') : 30;
+
+        return response()->json(Cache::remember("hub-summary:{$days}", 600, fn () => $this->summary($days)));
+    }
+
+    public function summary(int $days): array
+    {
+        $now   = CarbonImmutable::now();
+        $start = $now->startOfDay()->subDays($days - 1);
+        $prev  = $start->subDays($days);
+
+        // Real requests: published and not imported (seeded) from paper records.
+        $prs = fn () => ProcurementRequest::query()->where('is_published', true)->where(fn ($q) => $q->where('is_seeded', false)->orWhereNull('is_seeded'));
+
+        $filed     = $prs()->whereNull('cancelled_at')->where('created_at', '>=', $start)->count();
+        $filedPrev = $prs()->whereNull('cancelled_at')->where('created_at', '>=', $prev)->where('created_at', '<', $start)->count();
+
+        $approved     = $this->approvedBetween($start);
+        $approvedPrev = $this->approvedBetween($prev, $start);
+
+        // Requests still moving through the signatories, by PGSMS's own status rules.
+        $open = $prs()->whereNull('cancelled_at')->with(['signatory', 'remarks'])->get()
+            ->map(fn (ProcurementRequest $pr) => ['status' => ProcurementRequestStatus::getStatus($pr), 'updated' => $pr->updated_at])
+            ->filter(fn ($r) => in_array($r['status'], self::IN_PROCESS, true));
+        $stale    = $open->filter(fn ($r) => $r['updated'] && $r['updated']->lt($now->subDays(7)))->count();
+        $remarked = $open->where('status', 'Remarked')->count();
+
+        $pos       = PurchaseOrder::query()->where('is_published', true)->whereNull('cancelled_at');
+        $poCount   = (clone $pos)->where('created_at', '>=', $start)->count();
+        $poAmount  = (float) (clone $pos)->where('created_at', '>=', $start)->sum('total_amount');
+        $poPrevAmt = (float) (clone $pos)->where('created_at', '>=', $prev)->where('created_at', '<', $start)->sum('total_amount');
+
+        $alerts = [];
+        if ($stale) {
+            $alerts[] = ['level' => $stale >= 5 ? 'danger' : 'warning', 'text' => $stale . ' purchase ' . ($stale === 1 ? 'request has' : 'requests have') . ' waited more than 7 days for the next signature.'];
+        }
+        if ($remarked) {
+            $alerts[] = ['level' => 'info', 'text' => $remarked . ' purchase ' . ($remarked === 1 ? 'request has a remark' : 'requests have remarks') . ' to resolve.'];
+        }
+
+        return [
+            'as_of'   => $now->toIso8601String(),
+            'metrics' => [
+                ['label' => 'Purchase requests filed', 'value' => $filed, 'change' => self::change($filed, $filedPrev), 'good' => 'up',
+                 'hint' => $approved->count() . ' approved in this period'],
+                ['label' => 'Value of approved requests', 'value' => round($approved->sum(fn ($pr) => $this->amount($pr)), 2), 'format' => 'currency',
+                 'change' => self::change($approved->count(), $approvedPrev->count()), 'good' => 'up'],
+                ['label' => 'Purchase orders', 'value' => round($poAmount, 2), 'format' => 'currency', 'change' => self::change((int) $poAmount, (int) $poPrevAmt), 'good' => 'up',
+                 'hint' => $poCount . ' ' . ($poCount === 1 ? 'order' : 'orders') . ' issued'],
+                ['label' => 'Requests in process', 'value' => $open->count(), 'good' => 'down', 'hint' => $stale ? "{$stale} waiting over 7 days" : 'None waiting over 7 days'],
+            ],
+            'trend'     => $this->trend($days, $now, $prs),
+            'breakdown' => [
+                'label' => 'Requests by unit',
+                'items' => $prs()->whereNull('cancelled_at')->where('procurement_requests.created_at', '>=', $start)
+                    ->leftJoin('units', 'units.id', '=', 'procurement_requests.unit_id')
+                    ->selectRaw("COALESCE(units.code, 'Other') as name, count(*) as total")
+                    ->groupBy('name')->orderByDesc('total')->limit(8)->get()
+                    ->map(fn ($r) => ['label' => (string) $r->name, 'value' => (int) $r->total])->all(),
+            ],
+            'alerts' => $alerts,
+        ];
+    }
+
+    /** PRs approved between two dates: the approver's signature, or a paper PR's approval date. */
+    private function approvedBetween(CarbonImmutable $from, ?CarbonImmutable $to = null): Collection
+    {
+        $range = fn ($q, string $col) => $q->where($col, '>=', $from)->when($to, fn ($q) => $q->where($col, '<', $to));
+
+        return ProcurementRequest::query()->where('is_published', true)->whereNull('cancelled_at')
+            ->where(fn ($q) => $q
+                // Approved as HasSigner::approved() reads it: date, approver and signature.
+                ->whereHas('signatory', fn ($s) => $range($s->whereNotNull('approved_by')->whereNotNull('approved_signature'), 'approved_at'))
+                ->orWhere(fn ($p) => $range($p->where('origin', OriginType::Paper), 'paper_approved_at')))
+            ->with('items')->get();
+    }
+
+    /** A paper PR's recorded amount, else quantity × unit cost of its items (as HubApiController). */
+    private function amount(ProcurementRequest $pr): float
+    {
+        if ($pr->paperBased() && $pr->paper_amount) {
+            return (float) $pr->paper_amount;
+        }
+
+        return (float) $pr->items->sum(fn ($i) => (float) $i->quantity * (float) $i->unit_cost);
+    }
+
+    /** PRs filed per week (30 and 90 days) or per month (12 months), oldest first. */
+    private function trend(int $days, CarbonImmutable $now, \Closure $prs): array
+    {
+        $points = [];
+        $monthly = $days === 365;
+        for ($i = $monthly ? 11 : (int) ceil($days / 7) - 1; $i >= 0; $i--) {
+            $from = $monthly ? $now->startOfMonth()->subMonths($i) : $now->startOfWeek()->subWeeks($i);
+            $to   = $monthly ? $from->addMonth() : $from->addWeek();
+            $points[] = ['label' => $from->format($monthly ? 'M' : 'M j'),
+                'value' => $prs()->whereNull('cancelled_at')->where('created_at', '>=', $from)->where('created_at', '<', $to)->count()];
+        }
+
+        return ['label' => $monthly ? 'Purchase requests per month' : 'Purchase requests per week', 'points' => $points];
+    }
+
+    private static function change(int $now, int $before): ?int
+    {
+        return $before === 0 ? null : (int) round(($now - $before) / $before * 100);
+    }
+}
